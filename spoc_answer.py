@@ -172,6 +172,22 @@ def _load_paper(client, exam_id, class_id):
     return None, str((res or {}).get("msg") or "")
 
 
+def _record_sheet(client, exam_id, class_id, course_info_id, course_id):
+    # 设备锁时用记录卷面兜底（按 taskId 取，避免拿错卷）
+    info = client.api_get("spoc/exam/app/info", {
+        "id": exam_id, "examId": exam_id, "classId": class_id,
+        "courseInfoId": course_info_id, "courseId": course_id}, timeout=20)
+    task_id = str(((info or {}).get("data") or {}).get("taskId") or "")
+    if not task_id:
+        return [], ""
+    res = client.api_get("spoc/taskExamProblemRecord/examRecordPaperList", {
+        "taskId": task_id, "groupId": "", "examId": exam_id,
+        "classId": class_id, "userId": getattr(client, "stu_id", "") or ""}, timeout=20)
+    data = (res or {}).get("data")
+    qs = (data.get("questions") if isinstance(data, dict) else data) or []
+    return qs, task_id
+
+
 def _answer_map(questions):
     by_id = {}
     by_title = {}
@@ -603,6 +619,14 @@ def submit_spoc_exam(client, nickname, exam_id, class_id, course_info_id, course
                 log(f"[{nickname}] 进卷被设备验证拦截（{paper_msg}），按无视设备锁继续", "WARNING")
             else:
                 log(f"[{nickname}] 进卷未成功（{paper_msg}），继续尝试", "WARNING")
+
+    if (str(category_id) == "2" and not student_questions and not paper_qs
+            and (_mentions_device(enter_msg) or _mentions_device(paper_msg))):
+        sheet, rid = _record_sheet(client, exam_id, class_id, course_info_id, course_id)
+        if sheet:
+            student_questions = sheet
+            record_id = rid or record_id
+            log(f"[{nickname}] 设备锁：改用记录卷面 {len(sheet)} 题", "INFO")
 
     target = student_questions or paper_qs or questions or []
     if not target:
