@@ -2,7 +2,8 @@
 
 答案数据源优先级:
 - 资源库(RESOURCE):zyk_get_homework_answers 直接抓取服务端标准答案 → zyk_submit_exam AES 加密提交
-- SPOC/MOOC:find_classmate_answers(学生号直取/同学扫包) → 教师号预览补充 → 题库兜底 → 提交
+- SPOC: 平台公布面 + 免登录门 + 本地题库 → 交卷（无同学答案兜底）
+- MOOC: find_classmate_answers(本人卷/同学扫包) → 教师号预览补充 → 题库兜底 → 提交
 
 提交端点:
 - MOOC: POST ai.icve.com.cn/prod-api/course/exam/record(提交前 updateExamTime 累加时长)
@@ -19,6 +20,7 @@ from typing import Optional, Tuple
 
 from zjy_client import ZjyClient
 from utils import log
+import spoc_answer
 
 # 考试类型映射:categoryId → 中文类型名
 _TYPE_MAP = {"1": "作业", "2": "考试", "3": "测验"}
@@ -473,7 +475,8 @@ def _do_spoc_mooc_answer(client: ZjyClient, nickname: str, exam_id: str,
     """SPOC/MOOC 答题:答案检索 → 教师号补充 → 题库兜底 → 构建payload → 提交。"""
     # 1. 答案检索(学生号直取 + 同学扫包)
     questions, record = client.find_classmate_answers(
-        exam_id, class_id, course_info_id, course_id, ctype
+        exam_id, class_id, course_info_id, course_id, ctype,
+        door_merge=(ctype == "SPOC")
     )
     if not questions:
         log(f"[{nickname}] ❌ {title}: 未获取到题目", "WARNING")
@@ -515,28 +518,25 @@ def _do_spoc_mooc_answer(client: ZjyClient, nickname: str, exam_id: str,
     answerable = final_has_answer + len(composite_records)
     log(f"[{nickname}] 📊 {title}: 最终有答案 {answerable}/{len(questions)} 题", "INFO")
 
-    if answerable == 0:
+    if answerable == 0 and ctype != "SPOC":
         return False, "所有题目均无答案,无法提交"
 
     # 5. 计算答题时长(对齐商业版)
     valid_count = answerable
     base_time = valid_count * random.randint(15, 40)
     exam_time = max(base_time, random.randint(30, 120))
-    # MOOC: 考试最少1200秒(20分钟),测验最少300秒(5分钟),作业最少60秒,上限1800秒
-    # SPOC: 考试/测验/作业有不同最小值,但SPOC考试需真实等待,限制最大180秒避免阻塞
     if ctype == "MOOC":
         min_time = 1200 if str(category_id) == "2" else (300 if str(category_id) == "3" else 60)
         exam_time = max(min_time, min(exam_time, 1800))
     else:
         if str(category_id) == "2":
-            min_time = random.randint(900, 1200)
+            min_time = random.randint(960, 1080)
         elif str(category_id) == "3":
             min_time = random.randint(300, 500)
         else:
             min_time = random.randint(60, 180)
-        # SPOC考试需真实等待,限制最大180秒
         if str(category_id) == "2":
-            exam_time = min(exam_time, 180)
+            exam_time = max(min_time, min(exam_time, random.randint(960, 1080)))
         else:
             exam_time = max(min_time, min(exam_time, random.randint(1600, 1900)))
 
@@ -553,10 +553,10 @@ def _do_spoc_mooc_answer(client: ZjyClient, nickname: str, exam_id: str,
                                         matching_answers=matching_answers,
                                         composite_records=composite_records)
     else:
-        result = _submit_spoc_exam(client, nickname, exam_id, class_id,
-                                   course_info_id, course_id, category_id,
-                                   task_id, questions, exam_time, title)
-        ok = bool(result and result.get("code") == 200)
+        ok, msg = spoc_answer.submit_spoc_exam(
+            client, nickname, exam_id, class_id, course_info_id, course_id,
+            category_id, title, questions, exam_time)
+        result = {"code": 200 if ok else 500, "msg": msg}
 
     if ok:
         msg = (result or {}).get("msg", "提交成功")

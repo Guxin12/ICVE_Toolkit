@@ -22,6 +22,56 @@ from Crypto.Util.Padding import pad
 from requests.adapters import HTTPAdapter
 
 from utils import log
+from bank_utils import parse_options, translate_answer_text, reverse_answer_to_sortorders
+import no_login_door
+
+
+def sanitize_own_answer_sheet(qs, tag="", clear_draft=True):
+    """本人答卷面清洗：草稿不作答案源；已公布面（_published）不动。"""
+    for q in qs or []:
+        if not isinstance(q, dict) or q.get("_published"):
+            continue
+        q["_own_sheet"] = True
+        if not clear_draft:
+            continue
+        if q.get("answer"):
+            q["_own_draft"] = q.get("answer")
+            q["answer"] = ""
+        dj = q.get("dataJson")
+        if dj:
+            try:
+                arr = json.loads(dj) if isinstance(dj, str) else dj
+                if isinstance(arr, list):
+                    for o in arr:
+                        if isinstance(o, dict):
+                            o["IsAnswer"] = False
+                    q["dataJson"] = json.dumps(arr, ensure_ascii=False)
+            except Exception:
+                pass
+
+
+def remap_classmate_option_answer(type_id, classmate_answer, classmate_options, target_options):
+    """同学卷答案索引 -> 本卷 SortOrder（乱序安全）。"""
+    text = translate_answer_text(type_id, classmate_answer, classmate_options or [])
+    if not text:
+        return ""
+    return reverse_answer_to_sortorders(text, target_options or [])
+
+
+def spoc_row_submitted(status_val, exam_status=None, has_score=False, category_id="",
+                       use_exam_status=True):
+    """SPOC/资源库「是否已提交」判据。status=1 仅作业算已提交。"""
+    st = str(status_val if status_val is not None else "").strip()
+    if st == "-1":
+        return False
+    if has_score:
+        return True
+    if st == "2":
+        return True
+    if st == "1" and str(category_id or "") == "1":
+        return True
+    return bool(use_exam_status) and str(exam_status or "") == "3"
+
 
 # 连接池上限：requests 默认只缓存 10 条连接，刷课车道数一超过 10 就开始
 # "建连→用完即弃"，每条请求重付一次 TLS 握手（实测单条 RTT 从 ~0.07s 涨到 ~0.20s，
@@ -1826,7 +1876,7 @@ class ZjyClient:
             if q.get("answer") or q.get("correctAnswer") or q.get("rightAnswer"):
                 continue
             qid = str(q.get("questionId") or q.get("id") or "")
-            if q.get("isRight") is True:
+            if q.get("isRight") is True and not q.get("_own_sheet"):
                 ans = q.get("recordAnswer") or q.get("stuAnswer") or q.get("studentAnswer")
                 if ans:
                     parsed_ans = ans
@@ -1853,11 +1903,16 @@ class ZjyClient:
                             parsed_ans = ",".join(str(x) for x in arr)
                     except Exception:
                         pass
+                c_dj = c_info["dataJson"]
+                c_opts = parse_options({"dataJson": c_dj}) if c_dj else []
+                remapped = remap_classmate_option_answer(
+                    str(q.get("typeId") or ""), parsed_ans, c_opts, parse_options(q))
+                if remapped:
+                    parsed_ans = remapped
                 q["answer"] = parsed_ans
                 q["correctAnswer"] = parsed_ans
                 q["rightAnswer"] = parsed_ans
-                c_dj = c_info["dataJson"]
-                if c_dj:
+                if c_dj and not q.get("dataJson"):
                     q["dataJson"] = c_dj
                 elif q.get("dataJson") and parsed_ans:
                     try:
@@ -1910,19 +1965,12 @@ class ZjyClient:
     # ==================== SPOC/MOOC 答案检索主入口 ====================
 
     def find_classmate_answers(self, exam_id: str, class_id: str, course_info_id: str,
-                                course_id: str, ctype: str = "SPOC"):
-        """答案检索主入口(学生号直取 + 同学正确答案融合)。
-
-        答案数据源优先级:
-        1. 学生号 examRecordPaperList2 / examRecordPaperList(answer 标准答案)
-        2. 进入考试/作业获取真正 taskId 后再取
-        3. _get_classmate_correct_answers(同学 token 扫包 isRight=true 的答案)
-
-        :return: (questions_list, record_info) 或 (None, None)
-        """
+                                course_id: str, ctype: str = "SPOC", door_merge: bool = False):
+        """答案检索主入口(学生号直取 + 同学正确答案融合)。"""
         if ctype == "MOOC":
             return self._find_mooc_answers(exam_id, course_info_id, course_id)
-        return self._find_spoc_answers(exam_id, class_id, course_info_id, course_id)
+        return self._find_spoc_answers(exam_id, class_id, course_info_id, course_id,
+                                       door_merge=door_merge)
 
     def _find_mooc_answers(self, exam_id: str, course_info_id: str, course_id: str):
         """MOOC 答案检索。"""
@@ -1971,8 +2019,9 @@ class ZjyClient:
                 page += 1
         return None, None
 
-    def _find_spoc_answers(self, exam_id: str, class_id: str, course_info_id: str, course_id: str):
-        """SPOC 答案检索(三阶段降级 + 同学扫包融合)。"""
+    def _find_spoc_answers(self, exam_id: str, class_id: str, course_info_id: str, course_id: str,
+                           door_merge: bool = False):
+        """SPOC 答案检索(三阶段降级 + 同学扫包融合)。door_merge=True 时先过免登录门。"""
         try:
             info_data = self.api_get("spoc/exam/app/info", {
                 "id": exam_id, "examId": exam_id, "classId": class_id,
@@ -1982,7 +2031,7 @@ class ZjyClient:
                 d = info_data["data"]
                 task_id = d.get("taskId") or d.get("id")
                 if task_id:
-                    # Phase 1: examRecordPaperList2
+                    # Phase 1: examRecordPaperList2（答案公布面）
                     paper_data = self.api_get("spoc/taskExamProblemRecord/examRecordPaperList2", {
                         "taskId": task_id, "groupId": "", "examId": exam_id,
                         "classId": class_id, "userId": self.stu_id,
@@ -1990,14 +2039,21 @@ class ZjyClient:
                     if paper_data and paper_data.get("code") == 200 and paper_data.get("data"):
                         qs = paper_data["data"]
                         if isinstance(qs, list) and qs:
+                            for q in qs:
+                                if isinstance(q, dict):
+                                    q["_published"] = True
                             self._extract_isanswer_from_datajson(qs)
+                            if door_merge:
+                                no_login_door.merge_door_composite(qs)
+                                no_login_door.merge_door_answers(qs)
+                                return qs, d
                             if sum(1 for q in qs if q.get("answer") or q.get("recordAnswer")) > 0:
                                 still_no = sum(1 for q in qs if not q.get("answer") and not q.get("correctAnswer"))
                                 if still_no > 0:
                                     cmap = self._get_classmate_correct_answers(exam_id, class_id, course_info_id, course_id)
                                     qs = self._merge_correct_answers(qs, cmap or {})
                                 return qs, d
-                    # Phase 2: examRecordPaperList(不带2)
+                    # Phase 2: examRecordPaperList（本人卷，草稿先清洗）
                     paper_data_v1 = self.api_get("spoc/taskExamProblemRecord/examRecordPaperList", {
                         "taskId": task_id, "groupId": "", "examId": exam_id,
                         "classId": class_id, "userId": self.stu_id,
@@ -2005,6 +2061,11 @@ class ZjyClient:
                     if paper_data_v1 and paper_data_v1.get("code") == 200 and paper_data_v1.get("data"):
                         qs_v1 = paper_data_v1["data"]
                         if isinstance(qs_v1, list) and qs_v1:
+                            if door_merge:
+                                sanitize_own_answer_sheet(qs_v1, "examRecordPaperList")
+                                no_login_door.merge_door_composite(qs_v1)
+                                no_login_door.merge_door_answers(qs_v1)
+                                return qs_v1, d
                             self._extract_isanswer_from_datajson(qs_v1)
                             if sum(1 for q in qs_v1 if q.get("answer") or q.get("recordAnswer")) > 0:
                                 still_no = sum(1 for q in qs_v1 if not q.get("answer") and not q.get("correctAnswer"))
@@ -2013,8 +2074,13 @@ class ZjyClient:
                                     qs_v1 = self._merge_correct_answers(qs_v1, cmap or {})
                                 return qs_v1, d
                     # Phase 3: 进入考试获取真正 taskId
-                    qs = self._enter_exam_and_get_answers(exam_id, class_id, course_info_id, course_id)
+                    qs = self._enter_exam_and_get_answers(exam_id, class_id, course_info_id, course_id,
+                                                          door_merge=door_merge)
                     if qs:
+                        if door_merge:
+                            sanitize_own_answer_sheet(qs, "enter")
+                            no_login_door.merge_door_composite(qs)
+                            no_login_door.merge_door_answers(qs)
                         return qs, d
         except Exception as ex:
             log(f"[答案调试] SPOC 学生号直取异常: {ex}", "DEBUG")
@@ -2031,15 +2097,16 @@ class ZjyClient:
             try:
                 dj_list = json.loads(dj) if isinstance(dj, str) else dj
                 if isinstance(dj_list, list):
-                    true_opts = [i for i, opt in enumerate(dj_list)
+                    true_opts = [str(opt.get("SortOrder", i)) for i, opt in enumerate(dj_list)
                                  if str(opt.get("IsAnswer", "")).lower() == "true"]
                     if true_opts:
-                        q["answer"] = ",".join(str(i) for i in true_opts)
+                        q["answer"] = ",".join(true_opts)
             except Exception:
                 pass
 
     def _enter_exam_and_get_answers(self, exam_id: str, class_id: str,
-                                     course_info_id: str, course_id: str):
+                                     course_info_id: str, course_id: str,
+                                     door_merge: bool = False):
         """进入考试/作业获取真正 taskId,再拉取答案。"""
         try:
             _orig_ua = self.session.headers.get("User-Agent", "")
@@ -2077,15 +2144,18 @@ class ZjyClient:
                     if paper_data and paper_data.get("code") == 200 and paper_data.get("data"):
                         qs_enter = paper_data["data"]
                         if isinstance(qs_enter, list) and qs_enter:
-                            self._extract_isanswer_from_datajson(qs_enter)
-                            if sum(1 for q in qs_enter if q.get("answer") or q.get("recordAnswer")) > 0:
+                            if door_merge:
                                 qs = qs_enter
-                                still_no = sum(1 for q in qs if not q.get("answer") and not q.get("correctAnswer"))
-                                if still_no > 0:
-                                    cmap = self._get_classmate_correct_answers(exam_id, class_id, course_info_id, course_id)
-                                    qs = self._merge_correct_answers(qs, cmap or {})
                             else:
-                                qs = qs_enter
+                                self._extract_isanswer_from_datajson(qs_enter)
+                                if sum(1 for q in qs_enter if q.get("answer") or q.get("recordAnswer")) > 0:
+                                    qs = qs_enter
+                                    still_no = sum(1 for q in qs if not q.get("answer") and not q.get("correctAnswer"))
+                                    if still_no > 0:
+                                        cmap = self._get_classmate_correct_answers(exam_id, class_id, course_info_id, course_id)
+                                        qs = self._merge_correct_answers(qs, cmap or {})
+                                else:
+                                    qs = qs_enter
                     if _use_release:
                         try:
                             self.api_post("spoc/exam/releaseSession", {
